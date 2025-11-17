@@ -1,0 +1,402 @@
+﻿The Compositionality Gap: An Experimental Framework for Diagnosing and Mitigating Multi-Hop Reasoning Failures in Small Language Models
+
+
+
+
+Part 1: Theoretical Foundations and Experimental Setup
+
+
+This report details a step-by-step experimental plan designed to investigate and address a critical failure mode in small language models (SLMs): the inability to perform multi-hop reasoning, even when possessing the necessary knowledge. The investigation centers on a Llama 1B-scale model and a curated dataset where the model can correctly answer decomposed, single-hop sub-questions but fails to answer the composite multi-hop query.
+The experimental design is divided into two primary phases. Phase I: Diagnosis, aims to identify why this failure occurs, moving from correlational analysis (information tracing) to causal proof (activation patching). Phase II: Mitigation, proposes and tests a novel intervention strategy, "memory injection," to correct this failure by manipulating the model's internal activations.
+
+
+1.1 Defining the Failure Mode: Compositional Out-of-Distribution Failure
+
+
+The central challenge is multi-hop question answering (QA), a task that is foundational to complex, multi-step reasoning.2 Success in this domain "necessitates that QA models accurately resolve the first sub-question and utilize its answer to address the subsequent one".3 The observed failure of the 1B model highlights a well-documented phenomenon known as the "compositionality gap".4 This gap describes how, even as models scale and improve on single-hop questions, their ability to answer complex multi-hop questions lags behind meaningfully.4 This investigation provides a focused case study of this gap at the 1B parameter scale.
+The standard method for eliciting multi-step reasoning is Chain-of-Thought (CoT) prompting.5 However, CoT is widely understood as an emergent ability of scale 8, one that typically does not manifest in models smaller than ~100B parameters. SLMs attempting CoT often produce "semantic understanding errors" 9, where the model fails to grasp the relationship between variables, or generates incoherent text that does not follow from prior statements.9
+The experimental methodology at the heart of this research—pre-testing sub-questions—is a powerful diagnostic application of the "Decomposed Prompting" (DECOMP) framework.2 The DECOMP framework, in its original formulation, proposes solving complex tasks by breaking them into simpler sub-tasks and delegating them to a library of specialized "handlers".2
+The preliminary finding inverts this: it demonstrates that the Llama 1B model can function as a "sub-task handler" (it successfully solves Q1 and Q2 in isolation) but fails as a "composition engine" (it cannot solve the composite Q_Composite prompt). This precisely isolates the failure. It is not a failure of knowledge retrieval, as the model clearly possesses the facts required for A1 and A2. Instead, it is a failure of process-execution or working memory—the model cannot hold the intermediate answer A1 in its "working memory" while simultaneously computing the steps for Q2. This report outlines the experiments to test this central hypothesis.
+
+
+1.2 Establishing the Experimental Apparatus
+
+
+A reproducible and methodologically sound experimental setup is non-negotiable for generating publishable results. This requires careful selection of the base model, a standardized software environment, and a dedicated toolkit for performing causal interventions.
+
+
+1.2.1 Task 1: Model Selection
+
+
+The choice of the Llama 1B model is a critical methodological decision. The primary candidates at this scale are princeton-nlp/Sheared-LLaMA-1.3B 11 and the more recent meta-llama/Llama-3.2-1B.12 Sheared-LLaMA is a 1.3B parameter model derived from Llama-1 via structured pruning and has been shown to outperform other 1.3B models like OPT and Pythia.11 Llama 3.2 1B is a first-party model from Meta, part of a new collection of multilingual, small-scale models.12
+A critical error to avoid is the use of instruction-tuned or chat-finetuned models, such as princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT 15 or meta-llama/Llama-3.2-1B-Instruct.16 These models are finetuned on instruction-response pairs 15 to be "helpful" 15 and to better follow complex user prompts. This finetuning, while useful for practical applications, will mask or "patch over" the very fundamental architectural and compositional failures this research aims to isolate. Using an instruction-tuned model would introduce a confounding variable, making it impossible to determine if a success or failure is due to the base architecture or the finetuning.
+Therefore, this research must be conducted on a base, pre-trained model to ensure the findings are about the fundamental reasoning capabilities of the Llama architecture at this scale. This report will proceed assuming the use of meta-llama/Llama-3.2-1B 14 for its modern architecture, though princeton-nlp/Sheared-LLaMA-1.3B 11 remains a valid alternative.
+Table 1: Llama 1B Model Candidate Analysis for Methodological Soundness
+
+
+Model Checkpoint
+	Base Architecture
+	Training (Tokens)
+	Finetuning
+	Rationale for Selection/Rejection
+	princeton-nlp/Sheared-LLaMA-1.3B 11
+	Llama-1 (Pruned)
+	50B
+	None (Base Model)
+	Valid Candidate. High-performing 1.3B model.
+	princeton-nlp/Sheared-LLaMA-1.3B-ShareGPT 15
+	Llama-1 (Pruned)
+	50B + 10k ShareGPT
+	Instruction-Tuned
+	Reject. Finetuning masks the fundamental reasoning failures under investigation.
+	meta-llama/Llama-3.2-1B 14
+	Llama 3.2
+	Not specified, but part of Llama 3.2 family 13
+	None (Base Model)
+	Preferred Candidate. Modern, official Meta base model. Requires license agreement.14
+	meta-llama/Llama-3.2-1B-Instruct 16
+	Llama 3.2
+	(Llama 3.2 Base) + Instruct Data
+	Instruction-Tuned
+	Reject. Same as above; finetuning contaminates the experimental objective.
+	
+
+1.2.2 Task 2: Environment Setup and Model Loading
+
+
+The experimental environment will be built using the Hugging Face transformers 17 library. Accessing the Llama 3.2 models requires agreeing to the license terms on the Hugging Face model page and authenticating via the Hugging Face CLI.14
+The following script loads the selected base model and tokenizer, preparing it for experimentation.
+Code Block 1.2.1: Loading the Llama 1B Model
+
+
+Python
+
+
+
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# --- Configuration ---
+# Note: Requires prior `huggingface-cli login` after
+# agreeing to the license on the model's Hugging Face page.
+MODEL_ID = "meta-llama/Llama-3.2-1B"  # 
+
+# --- Load Tokenizer and Model ---
+print(f"Loading tokenizer for {MODEL_ID}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+# Set pad_token if not already set
+if tokenizer.pad_token is None:
+   tokenizer.pad_token = tokenizer.eos_token
+
+print(f"Loading model {MODEL_ID}...")
+model = AutoModelForCausalLM.from_pretrained(
+   MODEL_ID,
+   torch_dtype=torch.bfloat16,  # Use bfloat16 for memory and speed
+   device_map="auto"           # Automatically uses GPU if available
+)
+
+# Set model to evaluation mode
+model.eval()
+
+print("Model and tokenizer loaded successfully.")
+
+
+
+1.2.3 Task 3: Introduction to the Causal Intervention Toolkit (pyvene)
+
+
+The research goals of "backpatching" and "memory injection" are forms of causal intervention—manipulating the internal computations of a model to observe or change its behavior.19 The ideal library for this work is pyvene (Python VErsatile NEural interventions).22
+pyvene is an open-source library designed specifically for intervening on the internal states of PyTorch models.22 It is the correct choice for this project for several key reasons:
+1. Model Agnostic: It works out-of-the-box on any torch.nn.Module, including Hugging Face transformers models, without requiring any modification to the underlying model code.23
+2. Config-Based: Interventions are specified as serializable dict objects.23 This allows for a clean, modular experimental framework where new interventions can be designed and tested simply by passing a new configuration dictionary.
+3. Composable: pyvene supports complex, parallel, or sequential intervention schemes 23, which is essential for the multi-step "memory injection" (Phase II) experiment.
+The first step is to wrap the loaded model in pyvene's IntervenableModel class. This class takes the model and a configuration object, IntervenableConfig, which specifies which internal components are "intervention-ready."
+Code Block 1.2.2: Wrapping the Model for Intervention
+
+
+Python
+
+
+
+
+import pyvene as pv
+
+# 1. Define an intervention configuration
+# We must first identify the component names within the Llama 3.2 architecture
+# as defined by the Hugging Face transformers library.
+# The model has model.config.num_hidden_layers (e.g., 32)
+# The LlamaDecoderLayers are named 'model.layers.0', 'model.layers.1', etc.
+# Within each layer, we can target 'self_attn', 'mlp', etc.
+
+# Let's create a flexible config that allows intervention on
+# the output of every MLP block in every layer.
+num_layers = model.config.num_hidden_layers
+intervenable_config = pv.IntervenableConfig(
+   intervenable_representations=
+)
+
+# 2. Wrap the base model
+pv_model = pv.IntervenableModel(intervenable_config, model=model)
+pv_model.eval()
+
+print(f"Model wrapped in pyvene.IntervenableModel. Ready for interventions.")
+
+This pv_model object is now the primary tool for all subsequent experiments.23 It is a subclass of torch.nn.Module 23 and can be called just like the original model. The crucial difference is that its forward method now accepts additional arguments (like sources and intervention_locations) that allow for the runtime manipulation of activations. This architecture provides a single, reusable, and reproducible testbed for the entire diagnostic and mitigation protocol.
+
+
+Part 2: Phase I Experiments: Diagnosing the Information Bottleneck ("The Why")
+
+
+With the experimental apparatus established, Phase I proceeds with a series of diagnostic tests to pinpoint the cause of the compositional failure.
+
+
+2.1 Baseline Analysis: Replicating and Categorizing the Failure
+
+
+The first step is to formally replicate the initial finding using the pv_model and to build a qualitative taxonomy of the failure modes. A binary "pass/fail" metric is insufficient for a rigorous paper; a classification of how the model fails is required.
+Action: Iterate through the 1000-row dataset. For each entry, perform three "clean" (non-intervention) generation runs using the pv_model's generate method (which internally calls the forward method).
+
+
+Python
+
+
+
+
+# --- Pseudocode for Baseline Run ---
+# (Assumes a pandas DataFrame 'df' with columns 
+# )
+
+failure_data =
+for index, entry in df.iterrows():
+   # 1. Test Q1
+   inputs_q1 = tokenizer(entry.Q1, return_tensors="pt").to(pv_model.device)
+   output_q1 = pv_model.generate(inputs_q1['input_ids'], max_new_tokens=20)
+   #... (code to parse and check correctness of output_q1 vs A1_Correct)
+   q1_pass =... 
+
+   # 2. Test Q2 (using the correct A1 as context)
+   q2_prompt = entry.Q2_Template.format(A1=entry.A1_Correct)
+   inputs_q2 = tokenizer(q2_prompt, return_tensors="pt").to(pv_model.device)
+   output_q2 = pv_model.generate(inputs_q2['input_ids'], max_new_tokens=20)
+   #... (code to parse and check correctness of output_q2)
+   q2_pass =...
+
+   # 3. Test Q_Composite
+   inputs_comp = tokenizer(entry.Q_Composite, return_tensors="pt").to(pv_model.device)
+   output_comp_tokens = pv_model.generate(inputs_comp['input_ids'], max_new_tokens=20)
+   output_comp_text = tokenizer.decode(output_comp_tokens, skip_special_tokens=True)
+   #... (code to parse and check correctness of output_comp_text)
+   comp_pass =...
+
+   # 4. Filter for the target failure mode
+   if q1_pass and q2_pass and not comp_pass:
+       # This is our target for analysis. Now, categorize the failure.
+       failure_mode = "Unknown"
+       #... (Analysis code to check output_comp_text)
+       if... : failure_mode = "F1: Ignoring Hop 1"
+       elif... : failure_mode = "F2: Subject Hallucination"
+       elif... : failure_mode = "F3: Fact-Chaining Error"
+       
+       failure_data.append({
+           "Q_ID": entry.Q_ID,
+           "Q_Composite": entry.Q_Composite,
+           "SLM_Output": output_comp_text,
+           "Failure_Mode": failure_mode
+       })
+
+This analysis provides quantitative data for the types of errors, drawing from known failure modes like "semantic understanding error".9 The proposed failure taxonomy is:
+* F1: Ignoring Hop 1: The model's answer is a valid response to Q2 (e.g., "What was his next movie?") but ignores the context of Q1. It answers for a generic "his" or a different, hallucinated subject.
+* F2: Subject Hallucination: The model understands the 2-hop structure but fails to retrieve the correct A1 and instead chains a plausible-but-wrong fact (e.g., Q: "Who directed TDK? What was his next movie?" A: "Martin Scorsese directed TDK. His next movie was...").
+* F3: Fact-Chaining Error: The model implicitly gets A1 correct (the subject of the response is correct) but then fails to retrieve the correct fact for Q2. (e.g., A: "Christopher Nolan. His next movie was **.")
+This taxonomy will be formalized in the dataset for all 1000 entries.
+Table 2: Experimental Dataset Schema and Failure Taxonomy
+Q_ID
+	Q_Composite
+	A_Composite_Correct
+	SLM_A1_Pass (T/F)
+	SLM_Q2_Pass (T/F)
+	SLM_Composite_Pass (T/F)
+	SLM_Composite_Output
+	Failure_Mode (F1, F2, F3)
+	001
+	"Who directed Inception? What was his first feature film?"
+	"Christopher Nolan. His first feature film was Following."
+	True
+	True
+	False
+	"Christopher Nolan. His first feature film was The Dark Knight."
+	F3: Fact-Chaining Error
+	002
+	...
+	...
+	True
+	True
+	False
+	"A popular first feature film is..."
+	F1: Ignoring Hop 1
+	
+
+2.2 Diagnostic 1: Tracing Information Flow with the Logit Lens[a]
+
+
+This experiment aims to find correlational evidence for the "working memory" failure.[b]
+Hypothesis: The model successfully computes the intermediate answer A1 in its middle layers, but this representation is "overwritten" or "drowned out" by subsequent computations related to Q2 before it reaches the final output layer.[c]
+Methodology: The "Logit Lens".25 This technique works by taking the hidden state output from any layer and projecting it into the vocabulary space using the model's "unembedding" matrix (the lm_head). This allows for "reading" the model's "prediction" at every layer of computation.27[d]
+Action: For a given Q_Composite prompt, we will run the model once and use pyvene's CollectIntervention 29 to capture the hidden state at the final token position from every single layer. We will then project each of these states into the vocab space and track the rank of the correct A1 token.[e]
+Code Block 2.2.1: Logit Lens Experiment
+
+
+Python
+
+
+
+
+import torch.nn.functional as F
+
+# 1. Get the unembedding matrix (lm_head)
+unembed_matrix = pv_model.model.get_output_embeddings().weight
+
+# 2. Get tokens for Q_Composite and the intermediate answer A1
+# Example from Table 2:
+entry =... # Get entry 001
+prompt = entry.Q_Composite  # "Who directed Inception? What was his first feature film?"
+a1_answer = "Nolan" # The token we are looking for (use precise tokenization)
+
+# We must be careful with tokenization
+a1_token_id = tokenizer.encode(a1_answer, add_special_tokens=False)[-1]
+inputs = tokenizer(prompt, return_tensors="pt").to(pv_model.device)
+last_token_pos = inputs['input_ids'].shape[1] - 1
+
+# 3. Configure pyvene to COLLECT from ALL layers' outputs
+num_layers = pv_model.model.config.num_hidden_layers
+collect_config = pv.IntervenableConfig(
+   intervenable_representations=,
+   intervenable_intervention_types=pv.CollectIntervention  # [29]
+)
+pv_model.config = collect_config # Update the model's intervention config
+
+# 4. Run the model and collect states
+# We target the last token position for all layers
+with torch.no_grad():
+   _, (collected_states,) = pv_model(
+       inputs,
+       # We specify 'unit_locations' to tell pyvene *where* to collect
+       unit_locations={"sources->base": (None, [tuple([last_token_pos]) for _ in range(num_layers)])}
+   )
+
+# 5. Perform Logit Lens analysis
+a1_ranks =
+print(f"Tracking rank of token '{a1_answer}' (ID: {a1_token_id}) across layers:")
+for layer_idx, layer_state_batch in enumerate(collected_states):
+   # Get the state for our target token
+   # Shape is [batch, seq, hidden_dim], but we only collected one pos
+   last_token_state = layer_state_batch[0, 0, :] # Shape: [hidden_dim]
+   
+   # Project to vocab space: Shape [vocab_size]
+   logits = torch.matmul(last_token_state, unembed_matrix.t())
+   
+   # Get the rank of our target token A1
+   sorted_indices = torch.argsort(logits, descending=True)
+   rank = (sorted_indices == a1_token_id).nonzero(as_tuple=True).item()
+   a1_ranks.append(rank)
+   print(f"Layer {layer_idx}: Rank = {rank}")
+
+# 6. The output is the 'a1_ranks' list, which can be plotted.
+# (e.g., using matplotlib)
+
+Expected Outcome: This experiment will produce a chart for the paper: "Rank of A1 Token vs. Transformer Layer." The hypothesized result is a U-shaped or "fade-out" curve. The rank of A1 will be high (e.g., >1000) in early layers, decrease (e.g., <50) in the middle layers as the model computes/retrieves the fact, and then increase (worsen) in the final layers as the model's computation becomes dominated by the "what was his first feature film?" part of the prompt.
+This visualization provides powerful, intuitive evidence of the "cognitive overwrite" or "working memory" failure. It shows the model knew the intermediate answer but "forgot" it.27 This is a critical correlational finding that sets up the next causal experiment.
+
+
+2.3 Diagnostic 2: Testing the "Hopping Too Late" Hypothesis (Back-Patching)
+
+
+This experiment moves from correlation to causation, testing the specific "backpatching" hypothesis.
+Hypothesis: The failure is not that the information is lost forever, but that it is computed out of sync. The information needed for the A1 -> Q2 reasoning step is computed in a later layer, but it was needed in an earlier layer. This precise concept is explored in "Hopping Too Late" 31, which found that "a hidden representation from a later layer is patched back to an earlier layer" can correct the final answer in up to 57% of previously incorrect cases.
+Methodology: A "back-patch" is an "Interchange Intervention" 23, a specific form of path patching.23 We will use pyvene to run the same Q_Composite prompt twice in parallel:
+* The Base Run will be "interrupted" at an early layer (e.g., Layer 10).
+* The Source Run will provide an activation from a later layer (e.g., Layer 20).
+* The intervention will swap the Layer 20 activation into the Layer 10 computation.
+Action: We will iterate over the dataset, and for each failed query, we will attempt to "correct" it by back-patching from a set of late layers to a set of early layers.
+Code Block 2.3.1: Back-Patching Experiment
+
+
+Python
+
+
+
+
+# We will test patching from a LATE layer to an EARLY layer
+LATE_LAYER = 20
+EARLY_LAYER = 10
+COMPONENT_PATH = f"model.layers.{EARLY_LAYER}.mlp"
+COMPONENT_TYPE = "output"
+
+# 1. Define inputs
+entry =... # Get a failed entry from the dataset
+inputs = tokenizer(entry.Q_Composite, return_tensors="pt").to(pv_model.device)
+
+# 2. Define the intervention: swap from LATE_LAYER to EARLY_LAYER
+# The config targets the BASE (receiving) location
+backpatch_config = pv.IntervenableConfig(
+   intervenable_representations=,
+   intervenable_intervention_types=pv.VanillaIntervention # A simple swap/replace
+)
+pv_model.config = backpatch_config
+
+# 3. Define the intervention call
+# 'sources' provides the activation, 'base' receives it.
+# Both are running the SAME prompt.
+with torch.no_grad():
+   _, (backpatched_output,) = pv_model(
+       inputs,         # 'base' input
+       sources=inputs, # 'source' input is the same
+       
+       # This dictionary defines the source->base mapping
+       intervention_locations={
+           "sources->base": (
+               { # Source location (LATE)
+                   "layer": LATE_LAYER,
+                   "component": f"model.layers.{LATE_LAYER}.mlp",
+                   "unit": COMPONENT_TYPE,
+               },
+               { # Base location (EARLY)
+                   "layer": EARLY_LAYER,
+                   "component": COMPONENT_PATH,
+                   "unit": COMPONENT_TYPE,
+               }
+           )
+       }
+   )
+
+# 4. Generate text from the backpatched_output.logits
+# (This requires a more complex call to pv_model.generate with interventions,
+# or applying the intervention and then running a forward pass to get logits)
+
+# Simplified version: Get logits and check the next token
+with torch.no_grad():
+   backpatched_logits = pv_model(
+       inputs,
+       sources=inputs,
+       intervention_locations={...} # as above
+   )[1].logits # Get logits from the intervened run
+
+# Check if the logits for the final answer are now correct
+#... (analysis code)
+
+Analysis: This experiment is computationally expensive, as it involves a $Layers \times Layers$ matrix of possible patches. The experiment should be run over all 1000 failed items, patching from a representative late layer (e.g., L=20) to a representative early layer (e.g., L=10).
+The key metric is the "Correction Rate %": the percentage of previously failed Q_Composite queries that are corrected by the back-patch. If this rate is significantly greater than zero, it provides causal proof for the "Hopping Too Late" hypothesis.31 The information is present, but it is "temporally misaligned" within the architecture. This is the core diagnostic finding for the paper.
+
+
+[a]1 total reaction
+Harikrishnan S reacted with 🧎 at 2025-11-13 17:23 PM
+[b]1 total reaction
+Harikrishnan S reacted with 😙 at 2025-11-13 17:22 PM
+[c]1 total reaction
+Harikrishnan S reacted with 🤤 at 2025-11-13 17:22 PM
+[d]1 total reaction
+Harikrishnan S reacted with 🥹 at 2025-11-13 17:22 PM
+[e]1 total reaction
+Harikrishnan S reacted with 🤩 at 2025-11-13 17:23 PM

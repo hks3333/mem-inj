@@ -1,0 +1,8 @@
+datasets>=2.19.1
+pandas>=2.0.0
+requests>=2.31.0
+torch>=2.2.0
+transformers>=4.44.0
+accelerate>=0.31.0
+huggingface-hub>=0.24.0
+pyvene>=0.4.2

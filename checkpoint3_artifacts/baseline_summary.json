@@ -1,0 +1,18 @@
+{
+  "success": {
+    "count": 38,
+    "rate": 0.38
+  },
+  "F1_refusal": {
+    "count": 0,
+    "rate": 0.0
+  },
+  "F2_partial": {
+    "count": 8,
+    "rate": 0.08
+  },
+  "F3_other": {
+    "count": 54,
+    "rate": 0.54
+  }
+}

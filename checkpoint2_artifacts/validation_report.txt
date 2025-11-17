@@ -1,0 +1,12 @@
+CHECKPOINT 2 VALIDATION REPORT
+==============================
+
+MuSiQue rows: 406
+TwoHopFact rows: 1175
+
+MuSiQue: all sanity checks passed
+
+TwoHopFact: all sanity checks passed
+
+Combined success rows: 1581
+Combined dataset written to checkpoint2_artifacts\combined_success.csv
