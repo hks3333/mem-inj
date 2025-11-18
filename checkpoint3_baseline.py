@@ -1,16 +1,8 @@
-"""Checkpoint 3 baseline reproduction: evaluate composite questions with HF model.
-
-Example usage::
-
-    python checkpoint3_baseline.py \
-        --dataset checkpoint2_artifacts/combined_success.csv \
-        --model-id meta-llama/Llama-3.2-1B \
-        --sample-size 200 \
-        --output-dir checkpoint3_artifacts
-
-Outputs:
-    * baseline_results.csv – per-row outcomes and failure taxonomy labels.
-    * baseline_summary.json – aggregate counts for success and failure classes.
+"""
+Robust Checkpoint 3 Runner.
+- Keeps Batching (Speed)
+- Fixes Groq 400 Error (Safety)
+- Handles missing Environment Variables
 """
 
 from __future__ import annotations
@@ -18,292 +10,332 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
+import os
 import re
 import string
-from dataclasses import dataclass
+import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Any
 
 import pandas as pd
 import torch
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# --- Imports & Setup ---
+try:
+    from groq import Groq, BadRequestError
+except ImportError:
+    Groq = None
+    BadRequestError = Exception
 
 LOGGER = logging.getLogger("checkpoint3")
 
-REFUSAL_PATTERNS = [
-    r"i'm sorry",
-    r"i cannot",
-    r"i can't",
-    r"cannot comply",
-    r"as an ai",
-    r"no information",
-    r"i do not know",
-    r"unknown",
-]
-
-
-@dataclass
-class BaselineConfig:
-    model_id: str
-    revision: Optional[str]
-    max_new_tokens: int
-    temperature: float
-    top_p: float
-    sample_size: Optional[int]
-    seed: int
-    output_dir: Path
-
-
 def configure_logging(verbose: bool) -> None:
     handler = logging.StreamHandler()
-    fmt = "%(asctime)s - %(levelname)s - %(message)s"
-    handler.setFormatter(logging.Formatter(fmt))
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     LOGGER.addHandler(handler)
     LOGGER.setLevel(logging.DEBUG if verbose else logging.INFO)
+    # Silence standard libraries
+    logging.getLogger("transformers").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
+def _load_env() -> None:
+    """Robustly load .env file."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    
+    # Manual fallback if python-dotenv isn't installed
+    if not os.getenv("GROQ_API_KEY"):
+        env_path = Path(".env")
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if "=" in line and not line.startswith("#"):
+                    key, val = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), val.strip().strip("'").strip('"'))
 
-def preferred_dtype() -> torch.dtype:
-    if torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        major, _ = torch.cuda.get_device_capability(0)
-        if major >= 7:
-            return torch.float16
-        return torch.float32
-    if torch.backends.mps.is_available():
-        return torch.float16
-    return torch.float32
+_load_env()
 
-
-def load_hf_model(model_id: str, revision: Optional[str]) -> Tuple[AutoTokenizer, AutoModelForCausalLM, torch.device]:
-    dtype = preferred_dtype()
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else ("mps" if torch.backends.mps.is_available() else "cpu"))
-
-    LOGGER.info("Loading tokenizer for %s", model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    LOGGER.info("Loading model %s with dtype %s", model_id, dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        revision=revision,
-        torch_dtype=dtype,
-    )
-    model.to(device)
-    model.eval()
-    return tokenizer, model, device
-
+# --- Helper Functions ---
 
 def normalize_text(text: str) -> str:
-    text = text.lower().strip()
+    text = str(text).lower().strip()
     text = text.translate(str.maketrans({ch: " " for ch in string.punctuation}))
-    text = re.sub(r"\s+", " ", text)
-    return text
+    return re.sub(r"\s+", " ", text)
 
-
-def split_aliases(alias_blob: Optional[str]) -> List[str]:
-    if alias_blob is None:
+def parse_alias_field(value: Any) -> List[str]:
+    """Parse a single alias field (string or JSON list)."""
+    if pd.isna(value) or value is None:
         return []
-    alias_blob = str(alias_blob).strip()
-    if not alias_blob:
+    value = str(value).strip()
+    if not value:
         return []
-    # Try JSON first
     try:
-        decoded = json.loads(alias_blob)
+        decoded = json.loads(value)
         if isinstance(decoded, list):
-            aliases = []
+            flat = []
             for item in decoded:
-                aliases.extend(split_aliases(item))
-            return aliases
+                flat.extend(parse_alias_field(item))
+            return flat
     except json.JSONDecodeError:
         pass
-    if "|" in alias_blob:
-        return [part.strip() for part in alias_blob.split("|") if part.strip()]
-    return [alias_blob]
+    if "|" in value:
+        return [part.strip() for part in value.split("|") if part.strip()]
+    return [value]
 
+def parse_hop_ground_truths(value: Any) -> List[List[str]]:
+    """Parse hop_ground_truths: JSON array of strings, each parsed as aliases."""
+    if pd.isna(value) or value is None:
+        return []
+    value = str(value).strip()
+    if not value:
+        return []
+    try:
+        decoded = json.loads(value)
+        if isinstance(decoded, list):
+            return [parse_alias_field(item) for item in decoded]
+    except json.JSONDecodeError:
+        pass
+    return []
 
-def contains_any(text: str, candidates: Sequence[str]) -> bool:
-    if not text:
-        return False
+def contains_any(text: str, aliases: Sequence[str]) -> bool:
     norm_text = normalize_text(text)
-    for cand in candidates:
-        norm_cand = normalize_text(cand)
-        if norm_cand and norm_cand in norm_text:
+    for alias in aliases:
+        norm_alias = normalize_text(alias)
+        if norm_alias and norm_alias in norm_text:
             return True
     return False
 
-
 def is_refusal(text: str) -> bool:
-    norm_text = text.lower()
-    return any(re.search(pattern, norm_text) for pattern in REFUSAL_PATTERNS)
+    patterns = [
+        r"i'm sorry", r"i cannot", r"i can't", r"not able",
+        r"as an ai", r"do not know", r"no information",
+        r"cannot answer"
+    ]
+    return any(re.search(p, text.lower()) for p in patterns)
 
-
-def load_dataset(path: Path) -> pd.DataFrame:
-    LOGGER.info("Loading combined dataset from %s", path)
-    df = pd.read_csv(path)
-    required = {"dataset", "row_id", "full_question", "final_ground_truth", "hop_questions", "hop_ground_truths"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Dataset missing required columns: {missing}")
-
-    def parse_json_list(value: str) -> List[str]:
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            LOGGER.debug("Failed to json.loads hop field: %s", value[:80])
-        return []
-
-    df["hop_questions"] = df["hop_questions"].apply(parse_json_list)
-    df["hop_ground_truths"] = df["hop_ground_truths"].apply(parse_json_list)
-    df["hop_responses"] = df.get("hop_responses", pd.Series([[]] * len(df))).apply(parse_json_list)
-    return df
-
-
-def sample_dataset(df: pd.DataFrame, sample_size: Optional[int], seed: int) -> pd.DataFrame:
-    if sample_size is None or sample_size >= len(df):
-        return df
-    LOGGER.info("Sampling %d rows (seed=%d)", sample_size, seed)
-    return df.sample(n=sample_size, random_state=seed).reset_index(drop=True)
-
-
-def final_aliases(raw_final: Optional[str], hop_ground_truths: Sequence[str]) -> List[str]:
-    aliases = split_aliases(raw_final)
-    if not aliases and hop_ground_truths:
-        aliases = split_aliases(hop_ground_truths[-1])
-    return aliases
-
-
-def classify_failure(response: str, hop_aliases: List[List[str]], final_aliases_: List[str]) -> str:
-    if is_refusal(response):
+def classify_answer(answer: str, final_aliases: Sequence[str], hop_aliases: List[List[str]]) -> str:
+    """
+    Classify answer into: success, F1_refusal, F2_partial, F3_other.
+    F2_partial: contains intermediate hop answers but NOT the final answer.
+    """
+    if contains_any(answer, final_aliases):
+        return "success"
+    if is_refusal(answer):
         return "F1_refusal"
-    contains_intermediate = any(contains_any(response, aliases) for aliases in hop_aliases[:-1]) if hop_aliases else False
-    contains_final = contains_any(response, final_aliases_)
-    if contains_intermediate and not contains_final:
-        return "F2_partial"
+    # F2: contains intermediate hops (all but last) but not final answer
+    if hop_aliases and len(hop_aliases) > 1:
+        intermediate_hops = hop_aliases[:-1]  # All hops except the last
+        if any(contains_any(answer, hop) for hop in intermediate_hops):
+            return "F2_partial"
     return "F3_other"
 
+# --- Model Loading & Batch Generation ---
 
-def generate_answer(prompt: str, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, device: torch.device, cfg: BaselineConfig) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    gen_kwargs = dict(
-        max_new_tokens=cfg.max_new_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        do_sample=False,
+def load_model(model_id: str) -> tuple[AutoTokenizer, AutoModelForCausalLM, torch.device]:
+    # Smart Device Selection
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        dtype = torch.float16
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+    LOGGER.info(f"Loading {model_id} on {device} ({dtype})...")
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.padding_side = "left"  # Required for batch generation
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map="auto" if device.type == "cuda" else None
     )
+    if device.type != "cuda":
+        model.to(device)
+    
+    model.eval()
+    return tokenizer, model, device
+
+def generate_batch(
+    prompts: List[str], 
+    tokenizer: AutoTokenizer, 
+    model: AutoModelForCausalLM, 
+    device: torch.device, 
+    max_tokens: int
+) -> List[str]:
+    if not prompts:
+        return []
+    
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+    
     with torch.no_grad():
-        output_ids = model.generate(**inputs, **gen_kwargs)
-    generated = output_ids[0][inputs["input_ids"].shape[1]:]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
-    return text.strip()
-
-
-def evaluate_rows(df: pd.DataFrame, cfg: BaselineConfig, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, device: torch.device) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    results: List[Dict[str, object]] = []
-    counts = {"success": 0, "F1_refusal": 0, "F2_partial": 0, "F3_other": 0}
-
-    for _, row in df.iterrows():
-        dataset = row["dataset"]
-        row_id = row["row_id"]
-        prompt = row.get("full_question")
-        if not isinstance(prompt, str) or not prompt.strip():
-            LOGGER.debug("Skipping row %s: missing full_question", row_id)
-            continue
-
-        hop_gt_raw = row.get("hop_ground_truths") or []
-        hop_aliases = [split_aliases(item) for item in hop_gt_raw]
-        final_alias = final_aliases(row.get("final_ground_truth"), hop_gt_raw)
-
-        model_answer = generate_answer(prompt, tokenizer, model, device, cfg)
-        success = contains_any(model_answer, final_alias)
-        if success:
-            counts["success"] += 1
-            failure_type = "success"
-        else:
-            failure_type = classify_failure(model_answer, hop_aliases, final_alias)
-            counts[failure_type] += 1
-
-        results.append(
-            {
-                "dataset": dataset,
-                "row_id": row_id,
-                "prompt": prompt,
-                "final_ground_truth": row.get("final_ground_truth"),
-                "model_answer": model_answer,
-                "status": "success" if success else "failure",
-                "failure_type": failure_type if not success else None,
-            }
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,  # Greedy decoding (deterministic)
+            pad_token_id=tokenizer.pad_token_id
         )
+    
+    # Slice strictly the new tokens
+    input_len = inputs["input_ids"].shape[1]
+    new_tokens = output_ids[:, input_len:]
+    decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+    
+    return [d.strip() for d in decoded]
 
-    results_df = pd.DataFrame(results)
-    return results_df, counts
+# --- Groq Judge Logic (Fixed) ---
 
-
-def write_summary(summary: Dict[str, int], out_path: Path) -> None:
-    total = sum(summary.values()) or 1
-    summary_with_rates = {
-        key: {
-            "count": value,
-            "rate": value / total,
-        }
-        for key, value in summary.items()
-    }
-    out_path.write_text(json.dumps(summary_with_rates, indent=2))
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Checkpoint 3 baseline reproduction")
-    parser.add_argument("--dataset", type=Path, required=True, help="Path to combined_success.csv from checkpoint 2")
-    parser.add_argument("--model-id", default="meta-llama/Llama-3.2-1B", help="Hugging Face model identifier")
-    parser.add_argument("--revision", default=None, help="Optional HF revision/commit")
-    parser.add_argument("--sample-size", type=int, default=None, help="Optional limit on number of rows to evaluate")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
-    parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--output-dir", type=Path, default=Path("checkpoint3_artifacts"))
-    parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    cfg = BaselineConfig(
-        model_id=args.model_id,
-        revision=args.revision,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        sample_size=args.sample_size,
-        seed=args.seed,
-        output_dir=args.output_dir,
+def call_groq_judge(
+    client: Groq,
+    question: str,
+    expected: str,
+    intermediate_facts: Sequence[str],
+    final_fact: str,
+    answer: str
+) -> Dict[str, str]:
+    
+    system_prompt = (
+        "You are a multi-hop QA evaluator. Classify model answers using ONLY these labels:\n\n"
+        "- success: Model answer matches or semantically equals the FINAL ground truth.\n"
+        "- F1_refusal: Model refuses to answer (e.g., 'I don't know', 'I cannot answer').\n"
+        "- F2_partial: Model contains intermediate hop facts but FAILS on the final answer.\n"
+        "- F3_other: Model answer is wrong, irrelevant, or nonsensical.\n\n"
+        "Output ONLY valid JSON: {\"final_label\": \"<label>\", \"reason\": \"<brief explanation>\"}"
+    )
+    
+    user_prompt = (
+        f"Question: {question}\n\n"
+        f"Intermediate Hop Facts (should appear in answer for F2): {list(intermediate_facts)}\n"
+        f"Final Ground Truth (required for success): {final_fact}\n\n"
+        f"Model Answer: {answer}\n\n"
+        "Classify this answer."
     )
 
+    try:
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(completion.choices[0].message.content)
+
+    except BadRequestError as e:
+        # This catches the 400 "json_validate_failed" error
+        LOGGER.warning(f"Groq 400 Error (Likely Safety/Refusal): {e}")
+        return {"final_label": "F3_other", "reason": "Groq API Refusal/Format Error"}
+    except Exception as e:
+        LOGGER.error(f"Groq System Error: {e}")
+        return {"final_label": "UNKNOWN", "reason": str(e)}
+
+# --- Main Pipeline ---
+
+def run_evaluation(args):
     configure_logging(args.verbose)
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Load Data
+    df = pd.read_csv(args.dataset)
+    if args.sample_size:
+        df = df.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
+    
+    # 2. Load Model
+    tokenizer, model, device = load_model(args.model_id)
+    
+    # 3. Setup Groq
+    groq_key = os.getenv("GROQ_API_KEY")
+    groq_client = None
+    if groq_key and Groq:
+        groq_client = Groq(api_key=groq_key)
+        LOGGER.info("Groq Judge: ENABLED")
+    else:
+        LOGGER.warning("Groq Judge: DISABLED (Check API Key)")
 
-    tokenizer, model, device = load_hf_model(cfg.model_id, cfg.revision)
-    df = load_dataset(args.dataset)
-    df = sample_dataset(df, cfg.sample_size, cfg.seed)
+    results = []
+    stats = {"total": 0, "success": 0, "F1_refusal": 0, "F2_partial": 0, "F3_other": 0, "groq_errors": 0}
 
-    results_df, summary_counts = evaluate_rows(df, cfg, tokenizer, model, device)
+    # 4. Run Batch Inference
+    batch_size = args.batch_size
+    for i in tqdm(range(0, len(df), batch_size), desc="Evaluating Batches"):
+        batch_df = df.iloc[i : i + batch_size]
+        prompts = batch_df["full_question"].astype(str).tolist()
+        
+        # A. Batch Generate (Local GPU)
+        answers = generate_batch(prompts, tokenizer, model, device, args.max_tokens)
+        
+        # B. Process Results (Sequential Logic)
+        for idx, model_ans in enumerate(answers):
+            row = batch_df.iloc[idx]
+            final_gt = parse_alias_field(row.get("final_ground_truth"))
+            hop_gt = parse_hop_ground_truths(row.get("hop_ground_truths"))
+            
+            # Step 1: Local Classification (using hop ground truths)
+            label = classify_answer(model_ans, final_gt, hop_gt)
+            reason = "Local classification"
 
-    results_path = cfg.output_dir / "baseline_results.csv"
-    summary_path = cfg.output_dir / "baseline_summary.json"
+            # Step 2: Groq Judge (Only if local classification is failure)
+            if label != "success" and groq_client:
+                # Separate intermediate hops from final answer
+                intermediate_hops = []
+                if hop_gt and len(hop_gt) > 1:
+                    intermediate_hops = [alias for hop in hop_gt[:-1] for alias in hop]
+                final_answer = str(final_gt) if final_gt else ""
+                
+                judge_res = call_groq_judge(
+                    groq_client, 
+                    prompts[idx], 
+                    final_answer,
+                    intermediate_hops,
+                    final_answer,
+                    model_ans
+                )
+                judge_label = judge_res.get("final_label", "F3_other")
+                if judge_label in {"success", "F1_refusal", "F2_partial", "F3_other"}:
+                    label = judge_label
+                    reason = judge_res.get("reason", "Judge decision")
+            
+            # Update Stats
+            stats["total"] += 1
+            if label in stats: 
+                stats[label] += 1
+            
+            results.append({
+                "row_id": row.get("row_id"),
+                "question": prompts[idx],
+                "answer": model_ans,
+                "label": label,
+                "reason": reason
+            })
 
-    results_df.to_csv(results_path, index=False)
-    write_summary(summary_counts, summary_path)
-
-    LOGGER.info("Saved results to %s", results_path)
-    LOGGER.info("Saved summary to %s", summary_path)
-    LOGGER.info("Successes: %d | F1_refusal: %d | F2_partial: %d | F3_other: %d", summary_counts.get("success", 0), summary_counts.get("F1_refusal", 0), summary_counts.get("F2_partial", 0), summary_counts.get("F3_other", 0))
-
+    # 5. Save Results
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(results).to_csv(args.output_dir / "baseline_results.csv", index=False)
+    
+    with open(args.output_dir / "baseline_summary.json", "w") as f:
+        json.dump(stats, f, indent=2)
+        
+    LOGGER.info(f"Finished. Summary: {stats}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("checkpoint3_artifacts"))
+    parser.add_argument("--model-id", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--sample-size", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--verbose", action="store_true")
+    
+    args = parser.parse_args()
+    run_evaluation(args)

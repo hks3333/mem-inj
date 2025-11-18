@@ -1,0 +1,67 @@
+{
+  "total_tests": 10,
+  "passed": 10,
+  "failed": 0,
+  "examples": [
+    {
+      "prompt": "What is the capital of France?",
+      "base_output": "A. Paris B. New York C. Washington D. Baton Rouge\nA. 1",
+      "pyvene_output": "A. Paris B. New York C. Washington D. Baton Rouge\nA. 1",
+      "match": true
+    },
+    {
+      "prompt": "Who wrote Romeo and Juliet?",
+      "base_output": "Who wrote Romeo and Juliet?\nWho wrote Romeo and Juliet? Who wrote Romeo and Juliet?\nWho wrote",
+      "pyvene_output": "Who wrote Romeo and Juliet?\nWho wrote Romeo and Juliet? Who wrote Romeo and Juliet?\nWho wrote",
+      "match": true
+    },
+    {
+      "prompt": "What is 2 + 2?",
+      "base_output": "What is 2 + 2? What is 2 + 2? What is 2",
+      "pyvene_output": "What is 2 + 2? What is 2 + 2? What is 2",
+      "match": true
+    },
+    {
+      "prompt": "Explain quantum computing in one sentence.",
+      "base_output": "Quantum computing is a method of computing that uses quantum mechanics to perform calculations. It is based on the",
+      "pyvene_output": "Quantum computing is a method of computing that uses quantum mechanics to perform calculations. It is based on the",
+      "match": true
+    },
+    {
+      "prompt": "What is the largest planet in our solar system?",
+      "base_output": "What is the smallest planet in our solar system? What is the largest moon in our solar system?",
+      "pyvene_output": "What is the smallest planet in our solar system? What is the largest moon in our solar system?",
+      "match": true
+    },
+    {
+      "prompt": "Who was the first President of the United States?",
+      "base_output": "Who was the first President of the United States? Who was the first President of the United States?",
+      "pyvene_output": "Who was the first President of the United States? Who was the first President of the United States?",
+      "match": true
+    },
+    {
+      "prompt": "What is the chemical symbol for gold?",
+      "base_output": "What is the chemical symbol for gold?\nWhat is the chemical symbol for gold? What is the chemical",
+      "pyvene_output": "What is the chemical symbol for gold?\nWhat is the chemical symbol for gold? What is the chemical",
+      "match": true
+    },
+    {
+      "prompt": "How many continents are there?",
+      "base_output": "How many countries are there? How many countries are there in the world? How many countries are there",
+      "pyvene_output": "How many countries are there? How many countries are there in the world? How many countries are there",
+      "match": true
+    },
+    {
+      "prompt": "What is the speed of light?",
+      "base_output": "The speed of light is the speed at which electromagnetic waves travel. It is a constant, which is",
+      "pyvene_output": "The speed of light is the speed at which electromagnetic waves travel. It is a constant, which is",
+      "match": true
+    },
+    {
+      "prompt": "Name a famous mathematician.",
+      "base_output": "Most people will say Euler, Gauss, or Newton. But what about the man who discovered the Py",
+      "pyvene_output": "Most people will say Euler, Gauss, or Newton. But what about the man who discovered the Py",
+      "match": true
+    }
+  ]
+}

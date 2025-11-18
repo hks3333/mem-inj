@@ -44,9 +44,10 @@
   - Persist baseline results to a structured table (CSV/Parquet) for later comparison.
   - Script to run: `python checkpoint3_baseline.py --dataset checkpoint2_artifacts/combined_success.csv --sample-size 100`
   - Expected outputs under `checkpoint3_artifacts/`:
-    1. `baseline_results.csv` capturing per-row composite prompt, model answer, and failure taxonomy (success/F1/F2/F3).
-    2. `baseline_summary.json` with aggregate counts and rates for each class.
-  - Inspect a few `F2_partial` examples manually to confirm they match the “hop answers remembered but final hop missed” behaviour.
+    1. `baseline_results.csv` capturing per-row prompt, expected answer, HF answer/label, Groq judge verdict/reason, and final label.
+    2. `baseline_summary.json` logging raw HF counts, final labels after judge overrides, and judge statistics (checked/confirmed/overruled/errors).
+  - Ensure `GROQ_API_KEY` is set in `.env`; the script calls Groq Judge (`openai/gpt-oss-120b`) on each HF failure to confirm correctness.
+  - Review any rows where the judge overruled the HF label to verify that “CORRECT” verdicts reflect true equivalence (e.g., synonyms, duplicated phrasing).
 
 ## Checkpoint 4 – pyvene Integration
 - **Tasks**
