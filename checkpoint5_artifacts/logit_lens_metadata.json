@@ -1,0 +1,14 @@
+{
+  "total_cases": 10,
+  "labels": {
+    "F2_partial": 1,
+    "F3_other": 9
+  },
+  "target_labels": [
+    "F2_partial",
+    "F3_other"
+  ],
+  "model_id": "meta-llama/Llama-3.2-1B",
+  "dataset": "checkpoint2_artifacts\\combined_success.csv",
+  "baseline_results": "checkpoint3_artifacts\\baseline_results.csv"
+}
