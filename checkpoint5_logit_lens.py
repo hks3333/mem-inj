@@ -24,7 +24,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -47,6 +47,8 @@ class CaseSample:
     intermediate_answer: str
     target_token_id: int
     target_token_text: str
+    target_token_ids: List[int]
+    target_token_texts: List[str]
     baseline_answer: str
 
 
@@ -138,20 +140,39 @@ def parse_jsonish_list(value: Optional[str]) -> List:
         return []
 
 
+def _split_alias_string(text: str) -> List[str]:
+    parts = [part.strip() for part in text.split("|")]
+    return [part for part in parts if part]
+
+
 def flatten_aliases(seq: Iterable) -> List[str]:
     flat: List[str] = []
     for item in seq:
         if isinstance(item, (list, tuple, set)):
-            for sub in item:
-                if isinstance(sub, str):
-                    sub = sub.strip()
-                    if sub:
-                        flat.append(sub)
+            flat.extend(flatten_aliases(item))
         elif isinstance(item, str):
             cleaned = item.strip()
             if cleaned:
-                flat.append(cleaned)
+                if "|" in cleaned:
+                    flat.extend(_split_alias_string(cleaned))
+                else:
+                    flat.append(cleaned)
     return flat
+
+
+def apply_final_norm(model: AutoModelForCausalLM, hidden_vec: torch.Tensor) -> torch.Tensor:
+    """Apply the model's final RMSNorm (if present) to a hidden vector."""
+    core_model = getattr(model, "model", model)
+    norm_layer = getattr(core_model, "norm", None)
+    if norm_layer is None:
+        return hidden_vec
+
+    target_device = norm_layer.weight.device
+    target_dtype = norm_layer.weight.dtype
+    vec = hidden_vec.to(device=target_device, dtype=target_dtype)
+    if vec.dim() == 1:
+        return norm_layer(vec.unsqueeze(0)).squeeze(0)
+    return norm_layer(vec)
 
 
 def select_intermediate_answer(hop_ground_truths: List) -> Optional[str]:
@@ -159,6 +180,9 @@ def select_intermediate_answer(hop_ground_truths: List) -> Optional[str]:
         return None
     first_hop = hop_ground_truths[0]
     if isinstance(first_hop, str):
+        if "|" in first_hop:
+            aliases = _split_alias_string(first_hop)
+            return aliases[0] if aliases else None
         candidate = first_hop.strip()
         return candidate or None
     if isinstance(first_hop, (list, tuple, set)):
@@ -167,13 +191,12 @@ def select_intermediate_answer(hop_ground_truths: List) -> Optional[str]:
     return None
 
 
-def encode_target_token(tokenizer: AutoTokenizer, answer_text: str) -> Optional[tuple[int, str]]:
+def encode_target_token(tokenizer: AutoTokenizer, answer_text: str) -> Optional[Tuple[List[int], List[str]]]:
     token_ids = tokenizer.encode(answer_text, add_special_tokens=False)
     if not token_ids:
         return None
-    target_id = token_ids[-1]
-    token_str = tokenizer.decode([target_id]).strip()
-    return target_id, token_str
+    token_texts = [tokenizer.decode([tok_id]).strip() for tok_id in token_ids]
+    return token_ids, token_texts
 
 
 def load_failure_cases(
@@ -220,22 +243,27 @@ def prepare_cases(df: pd.DataFrame, tokenizer: AutoTokenizer) -> List[CaseSample
     for _, row in df.iterrows():
         hop_truths = parse_jsonish_list(row.get("hop_ground_truths_raw"))
         intermediate = select_intermediate_answer(hop_truths)
+
         if not intermediate:
             LOGGER.debug("Skipping row %s: no intermediate answer detected", row["row_id"])
             continue
+
         encoded = encode_target_token(tokenizer, intermediate)
         if not encoded:
             LOGGER.debug("Skipping row %s: tokenization produced empty ids", row["row_id"])
             continue
-        target_id, token_text = encoded
+
+        token_ids, token_texts = encoded
         samples.append(
             CaseSample(
                 row_id=row["row_id"],
                 label=row["label"],
                 question=row["composite_question"],
                 intermediate_answer=intermediate,
-                target_token_id=target_id,
-                target_token_text=token_text,
+                target_token_id=token_ids[0],
+                target_token_text=token_texts[0],
+                target_token_ids=token_ids,
+                target_token_texts=token_texts,
                 baseline_answer=row.get("baseline_answer", ""),
             )
         )
@@ -303,25 +331,41 @@ def run_logit_lens(
     else:
         layer_tensors = list(activations)
 
-    ranks: List[int] = []
-    top_logits: List[float] = []
+    best_ranks: List[int] = []
+    best_logits: List[float] = []
+    best_token_indices: List[int] = []
+    best_token_texts: List[str] = []
 
     for idx, tensor in enumerate(layer_tensors):
         if tensor is None:
-            ranks.append(-1)
-            top_logits.append(float("nan"))
+            best_ranks.append(-1)
+            best_logits.append(float("nan"))
+            best_token_indices.append(0)
+            best_token_texts.append("")
             continue
         if isinstance(tensor, (list, tuple)):
             tensor = next((t for t in tensor if isinstance(t, torch.Tensor)), None)
         if tensor is None:
-            ranks.append(-1)
-            top_logits.append(float("nan"))
+            best_ranks.append(-1)
+            best_logits.append(float("nan"))
+            best_token_indices.append(0)
+            best_token_texts.append("")
             continue
-        hidden_vec = extract_hidden_vector(tensor.to(unembed_weight.device))
-        logits = torch.matmul(hidden_vec, unembed_weight.T)
-        rank = compute_rank(logits, sample.target_token_id)
-        ranks.append(rank)
-        top_logits.append(logits[sample.target_token_id].item())
+        hidden_vec = extract_hidden_vector(tensor.to(device))
+        hidden_vec = apply_final_norm(pv_model.model, hidden_vec)
+        hidden_for_logits = hidden_vec.to(unembed_weight.device)
+        logits = torch.matmul(hidden_for_logits, unembed_weight.T)
+
+        token_ranks: List[int] = []
+        token_logits = logits[sample.target_token_ids]
+        for tok_id in sample.target_token_ids:
+            token_ranks.append(compute_rank(logits, tok_id))
+
+        best_idx = min(range(len(token_ranks)), key=lambda i: token_ranks[i])
+        best_ranks.append(token_ranks[best_idx])
+        best_logits.append(token_logits[best_idx].item())
+        best_token_indices.append(best_idx)
+        best_token_texts.append(sample.target_token_texts[best_idx])
 
     # Pull final forward logits for the last token (model prediction)
     final_logits = None
@@ -329,8 +373,10 @@ def run_logit_lens(
         final_logits = outputs.intervened_outputs.logits[0, last_token_index, :].detach().cpu()
 
     return {
-        "ranks": ranks,
-        "target_logit_per_layer": top_logits,
+        "best_ranks": best_ranks,
+        "best_logits": best_logits,
+        "best_token_indices": best_token_indices,
+        "best_token_texts": best_token_texts,
         "final_logits": final_logits,
     }
 
@@ -435,12 +481,16 @@ def main() -> None:
             "intermediate_answer": sample.intermediate_answer,
             "target_token_id": sample.target_token_id,
             "target_token_text": sample.target_token_text,
-            "layer_ranks": result["ranks"],
-            "target_logit_per_layer": result["target_logit_per_layer"],
+            "target_token_ids": sample.target_token_ids,
+            "target_token_texts": sample.target_token_texts,
+            "layer_best_ranks": result["best_ranks"],
+            "layer_best_logits": result["best_logits"],
+            "layer_best_token_indices": result["best_token_indices"],
+            "layer_best_token_texts": result["best_token_texts"],
         })
 
         if args.generate_plots:
-            maybe_generate_plot(result["ranks"], sample, args.output_dir)
+            maybe_generate_plot(result["best_ranks"], sample, args.output_dir)
 
     if not analysis_rows:
         LOGGER.error("No analyses completed successfully")
@@ -448,8 +498,12 @@ def main() -> None:
 
     # Save tabular summary (ranks encoded as JSON strings)
     summary_df = pd.DataFrame(analysis_rows)
-    summary_df["layer_ranks_json"] = summary_df["layer_ranks"].apply(json.dumps)
-    summary_df["target_logit_per_layer_json"] = summary_df["target_logit_per_layer"].apply(json.dumps)
+    summary_df["target_token_ids_json"] = summary_df["target_token_ids"].apply(json.dumps)
+    summary_df["target_token_texts_json"] = summary_df["target_token_texts"].apply(json.dumps)
+    summary_df["layer_ranks_json"] = summary_df["layer_best_ranks"].apply(json.dumps)
+    summary_df["target_logit_per_layer_json"] = summary_df["layer_best_logits"].apply(json.dumps)
+    summary_df["layer_best_token_indices_json"] = summary_df["layer_best_token_indices"].apply(json.dumps)
+    summary_df["layer_best_token_texts_json"] = summary_df["layer_best_token_texts"].apply(json.dumps)
 
     summary_csv_path = args.output_dir / "logit_lens_summary.csv"
     columns_to_export = [
@@ -459,8 +513,12 @@ def main() -> None:
         "intermediate_answer",
         "target_token_text",
         "target_token_id",
+        "target_token_ids_json",
+        "target_token_texts_json",
         "layer_ranks_json",
         "target_logit_per_layer_json",
+        "layer_best_token_indices_json",
+        "layer_best_token_texts_json",
     ]
     summary_df.to_csv(summary_csv_path, index=False, columns=columns_to_export)
     LOGGER.info("Saved summary CSV -> %s", summary_csv_path)

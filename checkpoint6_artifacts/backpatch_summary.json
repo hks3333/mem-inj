@@ -1,0 +1,41 @@
+{
+  "overall": {
+    "total_cases": 10,
+    "baseline_successes": 0,
+    "patched_successes": 0,
+    "new_success_cases": 0
+  },
+  "per_target_layer": {
+    "2": {
+      "runs": 10,
+      "patched_successes": 0,
+      "improvements": 0
+    },
+    "4": {
+      "runs": 10,
+      "patched_successes": 0,
+      "improvements": 0
+    },
+    "6": {
+      "runs": 10,
+      "patched_successes": 0,
+      "improvements": 0
+    },
+    "8": {
+      "runs": 9,
+      "patched_successes": 0,
+      "improvements": 0
+    }
+  },
+  "target_layers": [
+    2,
+    4,
+    6,
+    8
+  ],
+  "target_labels": [
+    "F2_partial",
+    "F3_other"
+  ],
+  "model_id": "meta-llama/Llama-3.2-1B"
+}
